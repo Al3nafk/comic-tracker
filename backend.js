@@ -5,6 +5,11 @@
 (function (root) {
   "use strict";
   const IS_PAGE = typeof document !== "undefined";
+  // Inside the Android app (Capacitor) requests go out natively, so no relay is needed.
+  const NATIVE = IS_PAGE && !!(root.Capacitor && root.Capacitor.isNativePlatform && root.Capacitor.isNativePlatform());
+  const APP_UA = "ComicTracker/1.0 (personal use; android app)"; // MangaDex wants an honest client name
+  const BROWSER_UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36";
+  const plugin = (n) => (root.Capacitor.Plugins && root.Capacitor.Plugins[n]) || root.Capacitor.registerPlugin(n);
   const MANGADEX_API = "https://api.mangadex.org";
   const DEFAULT_SETTINGS = { checkIntervalMinutes: 60, windowsToast: true, language: "en", dataSaver: false };
   const EDITABLE = new Set(["title", "status", "lastRead", "rating", "notes", "readUrl", "favorite", "tags"]);
@@ -65,6 +70,7 @@
   let RELAY = null; // { url, key }
   if (IS_PAGE) { try { RELAY = JSON.parse(localStorage.getItem("ct.relay") || "null"); } catch {} }
   async function relay() {
+    if (NATIVE) return {};
     if (!RELAY) RELAY = (await idbGet("relay")) || null;
     if (!RELAY) throw new Error("The app isn't connected to its relay yet. Open Settings → Connection.");
     return RELAY;
@@ -74,12 +80,31 @@
     await idbSet("relay", RELAY);
     if (IS_PAGE) { try { RELAY ? localStorage.setItem("ct.relay", JSON.stringify(RELAY)) : localStorage.removeItem("ct.relay"); } catch {} }
   }
-  const via = (u) => (RELAY ? `${RELAY.url}/?k=${encodeURIComponent(RELAY.key)}&u=${encodeURIComponent(u)}` : "");
+  const via = (u) => (NATIVE ? u : RELAY ? `${RELAY.url}/?k=${encodeURIComponent(RELAY.key)}&u=${encodeURIComponent(u)}` : "");
+
+  const isMangadex = (host) => /(^|\.)mangadex\.(org|network)$/.test(host);
+  function b64bytes(s) {
+    const bin = atob(s), a = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+    return a;
+  }
+  async function nativeFetch(url) {
+    const r = await plugin("CapacitorHttp").request({
+      url, method: "GET", responseType: "arraybuffer", connectTimeout: 20000, readTimeout: 30000,
+      headers: { "User-Agent": isMangadex(new URL(url).hostname) ? APP_UA : BROWSER_UA, "Accept-Language": "en-US,en;q=0.9" },
+    });
+    let body = r.data;
+    if (typeof body === "string") { try { body = b64bytes(body); } catch { body = new TextEncoder().encode(body); } }
+    else if (body && typeof body === "object") body = new TextEncoder().encode(JSON.stringify(body));
+    const h = new Headers();
+    for (const [k, v] of Object.entries(r.headers || {})) { try { h.set(k, String(v)); } catch {} }
+    return new Response(r.status === 204 || r.status === 304 ? null : body || null, { status: r.status || 200, headers: h });
+  }
 
   async function get(url) {
     await relay();
     let res;
-    try { res = await fetch(via(url)); } catch { throw new Error("No connection. Check your internet and try again."); }
+    try { res = NATIVE ? await nativeFetch(url) : await fetch(via(url)); } catch { throw new Error("No connection. Check your internet and try again."); }
     if (!res.ok) {
       let msg = "";
       try { msg = (await res.clone().json()).error || ""; } catch {}
@@ -258,6 +283,15 @@
 
   // ------------------------------------------------------------ notifications and update checks
   async function notify(title, body) {
+    if (NATIVE) {
+      if (!DATA.settings.windowsToast) return;
+      const LN = plugin("LocalNotifications");
+      let perm = await LN.checkPermissions();
+      if (perm.display === "prompt" || perm.display === "prompt-with-rationale") perm = await LN.requestPermissions();
+      if (perm.display !== "granted") return;
+      await LN.schedule({ notifications: [{ id: Math.floor(Math.random() * 2e9), title, body, extra: { tab: "updates" } }] });
+      return;
+    }
     if (!DATA.settings.windowsToast || typeof Notification === "undefined" || Notification.permission !== "granted") return;
     const reg = IS_PAGE ? await navigator.serviceWorker?.ready : root.registration;
     if (reg) await reg.showNotification(title, { body, icon: "icon-192.png", badge: "icon-192.png", tag: "ct-new", data: { url: "./?tab=updates" } });
@@ -683,8 +717,13 @@ called named kind sort lot think remember forgot original read reading book`.spl
       }
       if (p === "/api/story-search") return storySearch(String(body.q || ""));
       if (p === "/api/test-toast") {
-        if (typeof Notification === "undefined") throw new Error("This browser can't show notifications");
-        if (Notification.permission !== "granted" && (await Notification.requestPermission()) !== "granted") throw new Error("Notifications are blocked. Allow them for this app in your phone's settings.");
+        if (NATIVE) {
+          const LN = plugin("LocalNotifications");
+          let perm = await LN.checkPermissions();
+          if (perm.display !== "granted") perm = await LN.requestPermissions();
+          if (perm.display !== "granted") throw new Error("Notifications are blocked. Allow them for Comic Tracker in your phone's settings.");
+        } else if (typeof Notification === "undefined") throw new Error("This browser can't show notifications");
+        else if (Notification.permission !== "granted" && (await Notification.requestPermission()) !== "granted") throw new Error("Notifications are blocked. Allow them for this app in your phone's settings.");
         const was = DATA.settings.windowsToast; DATA.settings.windowsToast = true;
         await notify("Comic Tracker", "Notifications are working."); DATA.settings.windowsToast = was;
         return { ok: true };
@@ -718,6 +757,7 @@ called named kind sort lot think remember forgot original read reading book`.spl
   // ------------------------------------------------------------ background checks
   async function scheduleBackground() {
     // Android Chrome can wake an installed app now and then to check; how often is up to the phone.
+    if (NATIVE) return;
     try {
       const reg = await navigator.serviceWorker?.ready;
       if (!reg || !("periodicSync" in reg)) return;
@@ -727,11 +767,30 @@ called named kind sort lot think remember forgot original read reading book`.spl
     } catch {}
   }
 
-  root.CT = { handle, runCheck, data, setRelay, relay: () => RELAY, via, idbGet, idbSet, ensureCatalog, enrichWithWikipedia, scheduleBackground };
+  root.CT = { handle, runCheck, data, setRelay, relay: () => (NATIVE ? { native: true } : RELAY), native: NATIVE, plugin: NATIVE ? plugin : null, getJson, via, idbGet, idbSet, ensureCatalog, enrichWithWikipedia, scheduleBackground };
 
   if (!IS_PAGE) return;
   root.CT_BACKEND = handle;
-  root.CT_COVER = (u) => (/^https?:/.test(u) && RELAY ? via(u) : u);
+  root.CT_COVER = (u) => (/^https?:/.test(u) && RELAY && !NATIVE ? via(u) : u);
+
+  // MangaDex asks readers to report every image loaded from a MangaDex@Home server.
+  // In the Android app reader pages load straight from those servers, so report them here.
+  if (NATIVE) {
+    const report = (e) => {
+      const img = e.target;
+      if (!img || img.tagName !== "IMG") return;
+      let u; try { u = new URL(img.currentSrc || img.src); } catch { return; }
+      if (!u.hostname.endsWith(".mangadex.network")) return;
+      const t = performance.getEntriesByName(u.href).pop();
+      plugin("CapacitorHttp").request({
+        url: "https://api.mangadex.network/report", method: "POST",
+        headers: { "Content-Type": "application/json", "User-Agent": APP_UA },
+        data: { url: u.href, success: e.type === "load", cached: false, bytes: (t && (t.encodedBodySize || t.transferSize)) || 0, duration: Math.round((t && t.duration) || 0) },
+      }).catch(() => {});
+    };
+    document.addEventListener("load", report, true);
+    document.addEventListener("error", report, true);
+  }
 
   // A pairing link (…/#relay=URL&key=KEY) connects this phone; the hash never leaves the phone.
   const hash = new URLSearchParams(location.hash.slice(1));
@@ -745,7 +804,7 @@ called named kind sort lot think remember forgot original read reading book`.spl
 
   // Check on open, then on schedule while the app is open.
   async function maybeCheck() {
-    if (!RELAY || document.hidden) return;
+    if ((!RELAY && !NATIVE) || document.hidden) return;
     await data(true);
     const every = Math.max(10, DATA.settings.checkIntervalMinutes || 60) * 60000;
     if (!DATA.lastCheck || now() - DATA.lastCheck >= every) {

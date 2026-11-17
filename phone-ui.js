@@ -12,10 +12,11 @@
     .ct-bad { color: #f85149; font-weight: 600; }`;
   document.head.appendChild(css);
 
-  const connected = () => !!CT.relay();
+  const NATIVE = !!CT.native;
 
-  // ---- connection panel at the top of Settings
   const settings = $("#tab-settings");
+  // ---- connection panel at the top of Settings (web app only; the Android app needs no relay)
+  if (!NATIVE) {
   const panel = document.createElement("div");
   panel.className = "panel";
   panel.innerHTML = `
@@ -61,13 +62,14 @@
   banner.querySelector("button").onclick = () => document.querySelector('#nav [data-tab="settings"]').click();
   $("main").prepend(banner);
   showConn();
+  }
 
   // ---- phone wording in Settings
-  const upd = settings.querySelectorAll(".panel")[1];
-  upd.querySelector("p").textContent = "The app checks when you open it and on schedule while it's open. On Android, the installed app may also check in the background a few times a day; how often is up to your phone.";
+  const upd = [...settings.querySelectorAll(".panel")].find((p) => p.querySelector('input[name="windowsToast"]'));
+  upd.querySelector("p").textContent = NATIVE ? "The app checks for new chapters when you open it and on schedule while it's open." : "The app checks when you open it and on schedule while it's open. On Android, the installed app may also check in the background a few times a day; how often is up to your phone.";
   const toastBox = upd.querySelector('input[name="windowsToast"]');
   toastBox.parentElement.lastChild.textContent = " Notify me about new chapters";
-  toastBox.addEventListener("change", () => { if (toastBox.checked && "Notification" in window && Notification.permission === "default") Notification.requestPermission(); });
+  toastBox.addEventListener("change", () => { if (NATIVE) { if (toastBox.checked) CT.plugin("LocalNotifications").requestPermissions().catch(() => {}); return; } if (toastBox.checked && "Notification" in window && Notification.permission === "default") Notification.requestPermission(); });
   $("#browserNotif").style.display = "none"; // the page still updates its label, so hide it rather than remove it
   const test = $("#testToast"), fresh = test.cloneNode(true); // drop the PC wording
   test.replaceWith(fresh);
@@ -78,6 +80,8 @@
   credit.className = "meta";
   credit.innerHTML = `Chapters and covers from <a href="https://mangadex.org" target="_blank" rel="noopener">MangaDex</a> and its scanlation groups. Story search plots from <a href="https://en.wikipedia.org" target="_blank" rel="noopener">Wikipedia</a> (CC BY-SA 4.0).`;
   backup.after(Object.assign(document.createElement("div"), { className: "panel" })); backup.nextSibling.appendChild(credit);
+
+  if (NATIVE) androidApp(settings, backup);
 
   // ---- install button (Android Chrome)
   let deferred = null;
@@ -96,5 +100,57 @@
   if (new URLSearchParams(location.search).get("tab") === "updates") {
     document.querySelector('#nav [data-tab="updates"]')?.click();
     history.replaceState(null, "", location.pathname);
+  }
+
+  // ---- Android app only: back button, notification taps, backup sharing, app updates
+  function androidApp(settings, backup) {
+    const P = CT.plugin;
+    const tab = (name) => document.querySelector(`#nav [data-tab="${name}"]`)?.click();
+    P("App").addListener("backButton", () => {
+      const view = $("#rdView"), list = $("#rdList"), dlg = document.querySelector("dialog[open]");
+      if (dlg) return dlg.close();
+      if (view && !view.hidden) return $("#rdBack").click();
+      if (list && !list.hidden) return list.querySelector('[data-rd="close"]')?.click();
+      if (!document.querySelector('#nav [data-tab="library"]').classList.contains("on")) return tab("library");
+      P("App").minimizeApp().catch(() => P("App").exitApp());
+    });
+    P("App").addListener("resume", () => { load().catch(() => {}); });
+    P("LocalNotifications").addListener("localNotificationActionPerformed", () => { load().catch(() => {}); tab("updates"); });
+
+    // a web download doesn't work inside the app, so save the file and open the share sheet
+    const exp = $("#exportBtn"), fresh = exp.cloneNode(true);
+    exp.replaceWith(fresh);
+    fresh.addEventListener("click", async () => {
+      try {
+        const d = await api("/api/export");
+        const name = `comic-tracker-backup-${new Date().toISOString().slice(0, 10)}.json`;
+        const w = await P("Filesystem").writeFile({ path: name, data: JSON.stringify(d, null, 2), directory: "CACHE", encoding: "utf8" });
+        await P("Share").share({ title: "Comic Tracker backup", files: [w.uri] });
+      } catch (err) { if (!/cancel/i.test(err.message || "")) flash(err.message || "Couldn't export"); }
+    });
+    backup.querySelector("p").textContent = "Your library is saved in this app only. Export a backup now and then (you can save it to Drive or Files). To bring over your PC library, use Export backup in the PC app, send the file to your phone, and import it here.";
+
+    // app version and updates
+    const REPO = "Al3nafk/comic-tracker-android", build = +(window.CT_BUILD || 0);
+    const panel = document.createElement("div");
+    panel.className = "panel";
+    panel.innerHTML = `<h2>App</h2><p>Comic Tracker for Android, version ${build ? "1." + build : "dev"}.</p>
+      <p id="ctUpd" class="meta"></p>
+      <div class="row"><button class="btn" type="button" id="ctUpdBtn">Check for an update</button></div>`;
+    settings.appendChild(panel);
+    async function checkUpdate(quiet) {
+      const out = $("#ctUpd");
+      if (!quiet) out.textContent = "Checking…";
+      try {
+        const r = await CT.getJson(`https://api.github.com/repos/${REPO}/releases/latest`);
+        const latest = +String(r.tag_name || "").replace(/^v1\./, "") || 0;
+        if (latest > build) {
+          out.innerHTML = `Version 1.${latest} is out. <a href="https://github.com/${REPO}/releases/latest/download/ComicTracker.apk" target="_blank" rel="noopener">Download it</a>, open the file, and tap Update. Your library stays.`;
+          if (quiet) flash("A new version of the app is out. See Settings → App.");
+        } else if (!quiet) out.textContent = "You have the latest version.";
+      } catch (err) { if (!quiet) out.textContent = / 404$/.test(err.message) ? "You have the latest version." : "Couldn't check: " + err.message; }
+    }
+    $("#ctUpdBtn").onclick = () => checkUpdate(false);
+    setTimeout(() => checkUpdate(true), 8000);
   }
 })();
